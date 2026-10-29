@@ -1,0 +1,8 @@
+{
+    "chat.tools.terminal.autoApprove": {
+        "ss": true,
+        "make": true,
+        "timeout": true,
+        "zcat": true
+    }
+}
