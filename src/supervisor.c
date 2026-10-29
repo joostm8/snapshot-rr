@@ -57,6 +57,36 @@ static off_t snap_off, replay_off = -1, snap_off_pending;
 static enum { M_RECORD, M_REPLAY } mode;
 static int gen, logfd = -1, alert_fd, snap_fd;
 static unsigned nrec;
+
+/* ---- timing instrumentation ---- */
+struct acc {
+	unsigned n;
+	double sum, max;
+};
+struct snapwin {
+	double t0, t1; /* CLOCK_MONOTONIC seconds: tracee frozen from t0 to t1 */
+};
+#define MAXSNAP 1024
+static struct acc st_stall, st_rec; /* us per traced syscall: tracee stalled / of which recording */
+static struct acc st_freeze, st_dump; /* ms per snapshot */
+static struct snapwin snapwin[MAXSNAP];
+static unsigned nsnapwin;
+static double t_seen; /* when the current seccomp stop was noticed */
+
+static double now_s(void)
+{
+	struct timespec t;
+	clock_gettime(CLOCK_MONOTONIC, &t);
+	return t.tv_sec + t.tv_nsec * 1e-9;
+}
+
+static void acc_add(struct acc *a, double v)
+{
+	a->n++;
+	a->sum += v;
+	if (v > a->max)
+		a->max = v;
+}
 static volatile sig_atomic_t stop_req;
 
 /* syscall currently being recorded/replayed */
@@ -371,6 +401,7 @@ static void on_seccomp(void)
 	struct user_regs_struct r;
 	if (ptrace(PTRACE_GETREGS, tpid, 0, &r) < 0)
 		return;
+	t_seen = now_s();
 	cur_nr = r.orig_rax;
 	cur_args[0] = r.rdi; cur_args[1] = r.rsi; cur_args[2] = r.rdx;
 	cur_args[3] = r.r10; cur_args[4] = r.r8;  cur_args[5] = r.r9;
@@ -407,8 +438,16 @@ static void on_syscall_stop(void)
 		long ret = r.rax;
 		/* kernel-internal restart codes (e.g. blocked read interrupted by our SIGSTOP):
 		 * the syscall is re-issued and re-traced, so don't log this attempt */
-		if (!(ret >= -516 && ret <= -512))
+		if (!(ret >= -516 && ret <= -512)) {
+			double t_rec = now_s();
 			record_entry(ret);
+			double t_done = now_s();
+			/* a blocking read waits for the timer tick, which says nothing about overhead */
+			if (cur_nr != SYS_read) {
+				acc_add(&st_stall, (t_done - t_seen) * 1e6);
+				acc_add(&st_rec, (t_done - t_rec) * 1e6);
+			}
+		}
 	} else {
 		replay_apply(&r);
 	}
@@ -518,7 +557,7 @@ static void wait_stopped(void)
 {
 	char p[64], buf[512];
 	snprintf(p, sizeof p, "/proc/%d/stat", tpid);
-	for (int i = 0; i < 3000; i++) {
+	for (int i = 0; i < 20000; i++) {
 		int fd = open(p, O_RDONLY | O_CLOEXEC);
 		ssize_t n = fd >= 0 ? read(fd, buf, sizeof buf - 1) : -1;
 		if (fd >= 0)
@@ -529,7 +568,7 @@ static void wait_stopped(void)
 			if (c && c[2] == 'T')
 				return;
 		}
-		usleep(1000);
+		usleep(100);
 	}
 }
 
@@ -583,53 +622,122 @@ static void report_replay(void)
 	free(rep);
 }
 
+/* Summarise tracing cost, snapshot freezes and their effect on the control loop timing. */
+static void report_timing(void)
+{
+	const double tick_ms = TICK_NS * 1e-6;
+	unsigned windows = 0, late = 0, late_snap = 0, skip_first = 1;
+	unsigned long missed = 0;
+	double wake_avg = 0, wake_max = 0, proc_avg = 0, proc_max = 0;
+	char line[512];
+	FILE *f = fopen(log_path, "r");
+
+	while (f && fgets(line, sizeof line, f)) {
+		unsigned seq, n, miss;
+		double wa, wm, pa, pm, t, w;
+		if (sscanf(line, "[stat] seq=%u n=%u wake_avg=%lf wake_max=%lf proc_avg=%lf proc_max=%lf missed=%u",
+			   &seq, &n, &wa, &wm, &pa, &pm, &miss) == 7) {
+			if (skip_first) { /* first window includes start-up */
+				skip_first = 0;
+				continue;
+			}
+			windows++;
+			wake_avg += wa;
+			proc_avg += pa;
+			if (wm > wake_max) wake_max = wm;
+			if (pm > proc_max) proc_max = pm;
+		} else if (sscanf(line, "[late] seq=%u t=%lf wake_us=%lf missed=%u", &seq, &t, &w, &miss) == 4) {
+			late++;
+			missed += miss;
+			for (unsigned i = 0; i < nsnapwin; i++)
+				if (t >= snapwin[i].t0 && t <= snapwin[i].t1 + 0.5 * TICK_NS * 1e-9 + 0.005) {
+					late_snap++;
+					break;
+				}
+		}
+	}
+	if (f)
+		fclose(f);
+
+	printf("\n=== timing report (record phase, control tick = %.1f ms) ===\n", tick_ms);
+	if (st_stall.n)
+		printf("tracing: %u traced syscalls (excl. blocking read); tracee stalled per syscall avg %.0f us, max %.0f us (recording part avg %.0f us)\n",
+		       st_stall.n, st_stall.sum / st_stall.n, st_stall.max, st_rec.sum / st_rec.n);
+	if (windows)
+		printf("control loop (controller's own clock, %u x 100 ticks): wake-up latency avg %.0f us, max %.0f us; per-tick work avg %.0f us, max %.0f us\n",
+		       windows, wake_avg / windows, wake_max, proc_avg / windows, proc_max);
+	if (st_freeze.n) {
+		unsigned over = 0;
+		for (unsigned i = 0; i < nsnapwin; i++)
+			if ((snapwin[i].t1 - snapwin[i].t0) * 1e3 > tick_ms)
+				over++;
+		printf("snapshots: %u; controller frozen avg %.1f ms, max %.1f ms (criu dump avg %.1f ms, max %.1f ms); %u of %u froze it longer than one tick\n",
+		       st_freeze.n, st_freeze.sum / st_freeze.n, st_freeze.max, st_dump.sum / st_dump.n,
+		       st_dump.max, over, st_freeze.n);
+	}
+	printf("late ticks (wake-up > 5 ms or timer ticks missed): %u, %lu ticks missed in total; %u coincide with a snapshot freeze, %u do not\n\n",
+	       late, missed, late_snap, late - late_snap);
+	fflush(stdout);
+}
+
 static void take_snapshot(void)
 {
 	if (!alive || alert_pending())
 		return;
-	struct timespec t0, t1;
-	clock_gettime(CLOCK_MONOTONIC, &t0);
+	int next = gen + 1;
+	char tmp[PATH_MAX], fin[PATH_MAX], pidstr[16];
+	snprintf(tmp, sizeof tmp, "%s/snap/.tmp", cfg.workdir);
+	gen_path(fin, "snap", next, "");
+	snprintf(pidstr, sizeof pidstr, "%d", tpid);
+	rm_rf(tmp);
+	mkdir(tmp, 0755);
+	char *dump[] = {(char *)cfg.criu, "dump", "-t", pidstr, "-D", tmp, "--leave-running",
+			"-o", "dump.log", "-v4", NULL};
+
 	if (stop_tracee() < 0)
 		return;
 	if (alert_pending())
 		return; /* fault in flight: leave it frozen, the main loop handles the alert */
 
+	/* The tracee is frozen from here until attach_resume(): keep this section free of I/O. */
+	double t_stop = now_s();
 	/* CRIU must seize the task itself, so hand it over in a plain group-stop. Nothing runs
 	 * in between, so the filter never sees a traced syscall without a tracer. */
 	snap_off_pending = log_size(); /* tracee is stopped, so this is exact */
 	ptrace(PTRACE_DETACH, tpid, 0, (void *)(long)SIGSTOP);
 	suspended = 0;
 	wait_stopped();
-
-	int next = gen + 1;
-	char tmp[PATH_MAX], fin[PATH_MAX], pidstr[16];
-	snprintf(tmp, sizeof tmp, "%s/snap/.tmp", cfg.workdir);
-	gen_path(fin, "snap", next, "");
-	rm_rf(tmp);
-	mkdir(tmp, 0755);
-	snprintf(pidstr, sizeof pidstr, "%d", tpid);
-	char *dump[] = {(char *)cfg.criu, "dump", "-t", pidstr, "-D", tmp, "--leave-running",
-			"-o", "dump.log", "-v4", NULL};
+	double t_dump0 = now_s();
 	int rc = run_cmd(dump);
-	if (rc == 0 && rename(tmp, fin) == 0) {
-		unsigned old = nrec;
+	double t_dump1 = now_s();
+	int ok = rc == 0 && rename(tmp, fin) == 0;
+	unsigned old = nrec;
+	if (ok) {
 		snap_off = snap_off_pending;
 		gen = next;
 		trace_open(gen);
-		clock_gettime(CLOCK_MONOTONIC, &t1);
-		say("snapshot %d taken (%ld ms, %u syscalls recorded since previous)\n", gen,
-		    (t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_nsec - t0.tv_nsec) / 1000000, old);
-		char p[PATH_MAX];
-		if (gen >= cfg.keep) {
-			gen_path(p, "snap", gen - cfg.keep, "");
-			rm_rf(p);
-			gen_path(p, "trace", gen - cfg.keep, ".bin");
-			unlink(p);
-		}
-	} else {
-		say("criu dump failed (rc=%d), see %s/dump.log; keeping previous snapshot\n", rc, tmp);
 	}
 	attach_resume();
+	double t_end = now_s();
+
+	if (!ok) {
+		say("criu dump failed (rc=%d), see %s/dump.log; keeping previous snapshot\n", rc, tmp);
+		return;
+	}
+	acc_add(&st_freeze, (t_end - t_stop) * 1e3);
+	acc_add(&st_dump, (t_dump1 - t_dump0) * 1e3);
+	if (nsnapwin < MAXSNAP)
+		snapwin[nsnapwin++] = (struct snapwin){t_stop, t_end};
+	say("snapshot %d: controller frozen %.1f ms (detach %.1f + criu dump %.1f + reattach %.1f), %u syscalls recorded since previous\n",
+	    gen, (t_end - t_stop) * 1e3, (t_dump0 - t_stop) * 1e3, (t_dump1 - t_dump0) * 1e3,
+	    (t_end - t_dump1) * 1e3, old);
+	if (gen >= cfg.keep) {
+		char p[PATH_MAX];
+		gen_path(p, "snap", gen - cfg.keep, "");
+		rm_rf(p);
+		gen_path(p, "trace", gen - cfg.keep, ".bin");
+		unlink(p);
+	}
 }
 
 /* ---- fault handling / replay ---- */
@@ -727,6 +835,7 @@ static void handle_alert(void)
 		return;
 	}
 	say("controller (pid %d) suspended; last snapshot=%d, %u syscalls recorded since\n", tpid, gen, nrec);
+	report_timing();
 	if (do_replay() < 0)
 		finish(1);
 }
@@ -859,6 +968,8 @@ int main(int argc, char **argv)
 
 	if (stop_req && !finished)
 		final_rc = 130;
+	if (mode == M_RECORD)
+		report_timing();
 	if (alive)
 		kill(tpid, SIGKILL);
 	if (mode == M_REPLAY)

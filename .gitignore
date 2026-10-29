@@ -1,5 +1,6 @@
 /build
 /run
+/run-bench
 # Prerequisites
 *.d
 
