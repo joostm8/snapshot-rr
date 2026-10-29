@@ -19,5 +19,6 @@ struct __attribute__((packed)) act_msg {
 };
 
 /* Syscalls whose results are nondeterministic; the seccomp filter traps exactly these. */
+/* Nondeterministic inputs (results are recorded) plus sendto (payload is recorded and verified on replay). */
 #define TRACED_SYSCALLS \
-	SYS_read, SYS_recvfrom, SYS_clock_gettime, SYS_gettimeofday, SYS_time, SYS_getrandom
+	SYS_read, SYS_recvfrom, SYS_clock_gettime, SYS_gettimeofday, SYS_time, SYS_getrandom, SYS_sendto

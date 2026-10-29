@@ -52,6 +52,8 @@ static struct {
 static char sock_path[PATH_MAX], log_path[PATH_MAX];
 static pid_t tpid;
 static int alive, suspended, finished, final_rc = 1;
+/* controller.log offsets: at the restored snapshot, and where the replayed output starts */
+static off_t snap_off, replay_off = -1, snap_off_pending;
 static enum { M_RECORD, M_REPLAY } mode;
 static int gen, logfd = -1, alert_fd, snap_fd;
 static unsigned nrec;
@@ -65,7 +67,7 @@ static uint64_t cur_args[6];
 /* replay state: whole trace file in memory */
 static unsigned char *rbuf;
 static size_t rlen, roff, ent_off, ent_next;
-static unsigned rcount, ridx;
+static unsigned rcount, ridx, sends_ok;
 
 struct ent_hdr {
 	int32_t nr, nreg;
@@ -102,6 +104,7 @@ static const char *sysname(long nr)
 	case SYS_clock_gettime: return "clock_gettime";
 	case SYS_gettimeofday: return "gettimeofday";
 	case SYS_time: return "time";
+	case SYS_sendto: return "sendto";
 	case SYS_getrandom: return "getrandom";
 	}
 	return "?";
@@ -149,11 +152,14 @@ static ssize_t mem_rw(int wr, uint64_t addr, void *buf, size_t len)
 	return r;
 }
 
-/* Memory the kernel wrote for a syscall; this is the "result" we have to reproduce. */
+/* Memory the kernel wrote for a syscall (the result to reproduce); for sendto, the payload sent. */
 static int out_regions(long nr, const uint64_t a[6], long ret, struct region r[2])
 {
 	int n = 0;
 	switch (nr) {
+	case SYS_sendto:
+		r[n++] = (struct region){a[1], a[2] < 65507 ? a[2] : 65507};
+		break;
 	case SYS_read:
 	case SYS_getrandom:
 	case SYS_recvfrom:
@@ -311,6 +317,21 @@ static void replay_apply(struct user_regs_struct *r)
 	struct ent_hdr h;
 	size_t o = ent_off;
 	memcpy(&h, rbuf + o, sizeof h);
+	if (cur_nr == SYS_sendto) {
+		/* the real send ran; only verify its result */
+		if ((long)r->rax != h.ret) {
+			say("replay: DIVERGENCE at syscall #%u: sendto returned %ld, trace has %ld\n",
+			    ridx + 1, (long)r->rax, (long)h.ret);
+			finish(2);
+			return;
+		}
+		sends_ok++;
+		ridx++;
+		roff = ent_next;
+		if (cfg.verbose)
+			say("replay #%u sendto = %ld (payload matches)\n", ridx, (long)h.ret);
+		return;
+	}
 	o += sizeof h;
 	for (int i = 0; i < h.nreg; i++) {
 		struct reg_hdr rh;
@@ -327,6 +348,24 @@ static void replay_apply(struct user_regs_struct *r)
 		say("replay #%u %s = %ld\n", ridx, sysname(h.nr), (long)h.ret);
 }
 
+/* Replay: does the payload the tracee is about to send equal the recorded one? */
+static int sendto_matches(void)
+{
+	struct ent_hdr h;
+	struct reg_hdr rh;
+	memcpy(&h, rbuf + ent_off, sizeof h);
+	memcpy(&rh, rbuf + ent_off + sizeof h, sizeof rh);
+	unsigned char *live = malloc(rh.len ? rh.len : 1);
+	int ok = mem_rw(0, cur_args[1], live, rh.len) == (ssize_t)rh.len &&
+		 !memcmp(live, rbuf + ent_off + sizeof h + sizeof rh, rh.len);
+	free(live);
+	if (!ok) {
+		say("replay: DIVERGENCE at syscall #%u: sendto payload differs from the recording\n", ridx + 1);
+		finish(2);
+	}
+	return ok;
+}
+
 static void on_seccomp(void)
 {
 	struct user_regs_struct r;
@@ -338,8 +377,13 @@ static void on_seccomp(void)
 	if (mode == M_REPLAY) {
 		if (!replay_check())
 			return; /* tracee stays stopped */
-		r.orig_rax = -1; /* skip the real syscall; result injected at exit stop */
-		ptrace(PTRACE_SETREGS, tpid, 0, &r);
+		if (cur_nr == SYS_sendto) {
+			if (!sendto_matches())
+				return;
+		} else {
+			r.orig_rax = -1; /* skip the real syscall; result injected at exit stop */
+			ptrace(PTRACE_SETREGS, tpid, 0, &r);
+		}
 	}
 	pending = 1;
 	resume(PTRACE_SYSCALL, 0);
@@ -489,6 +533,56 @@ static void wait_stopped(void)
 	}
 }
 
+static off_t log_size(void)
+{
+	struct stat st;
+	return stat(log_path, &st) == 0 ? st.st_size : 0;
+}
+
+/* Controller log lines in [from, to) minus the pid banner; caller frees. */
+static char *log_range(off_t from, off_t to)
+{
+	char *raw = calloc(1, to - from + 1), *out = calloc(1, to - from + 1);
+	int fd = open(log_path, O_RDONLY | O_CLOEXEC);
+	if (fd >= 0 && to > from && pread(fd, raw, to - from, from) < 0)
+		raw[0] = 0;
+	if (fd >= 0)
+		close(fd);
+	for (char *l = strtok(raw, "\n"); l; l = strtok(NULL, "\n"))
+		if (strncmp(l, "[ctrl] pid ", 11))
+			strcat(strcat(out, l), "\n");
+	free(raw);
+	return out;
+}
+
+static void save_text(const char *name, const char *text)
+{
+	char p[PATH_MAX];
+	snprintf(p, sizeof p, "%s/%s", cfg.workdir, name);
+	FILE *f = fopen(p, "w");
+	if (f) {
+		fputs(text, f);
+		fclose(f);
+	}
+}
+
+static void report_replay(void)
+{
+	if (replay_off < 0)
+		return;
+	char *orig = log_range(snap_off, replay_off), *rep = log_range(replay_off, log_size());
+	save_text("original.log", orig);
+	save_text("replay.log", rep);
+	printf("\n=== controller output, original run (from snapshot %d) ===\n%s", gen, orig);
+	printf("=== controller output, replayed from trace (plant down) ===\n%s", rep);
+	printf("=== printed logs %s (saved as original.log / replay.log) ===\n", strcmp(orig, rep) ? "DIFFER" : "IDENTICAL");
+	printf("=== %u sendto payloads (actuator commands, fault alert) matched the recording byte for byte ===\n\n",
+	       sends_ok);
+	fflush(stdout);
+	free(orig);
+	free(rep);
+}
+
 static void take_snapshot(void)
 {
 	if (!alive || alert_pending())
@@ -502,6 +596,7 @@ static void take_snapshot(void)
 
 	/* CRIU must seize the task itself, so hand it over in a plain group-stop. Nothing runs
 	 * in between, so the filter never sees a traced syscall without a tracer. */
+	snap_off_pending = log_size(); /* tracee is stopped, so this is exact */
 	ptrace(PTRACE_DETACH, tpid, 0, (void *)(long)SIGSTOP);
 	suspended = 0;
 	wait_stopped();
@@ -518,6 +613,7 @@ static void take_snapshot(void)
 	int rc = run_cmd(dump);
 	if (rc == 0 && rename(tmp, fin) == 0) {
 		unsigned old = nrec;
+		snap_off = snap_off_pending;
 		gen = next;
 		trace_open(gen);
 		clock_gettime(CLOCK_MONOTONIC, &t1);
@@ -579,6 +675,7 @@ static int do_replay(void)
 	if (logfd >= 0)
 		close(logfd);
 	logfd = -1;
+	replay_off = log_size();
 
 	if (cfg.use_criu && gen > 0) {
 		gen_path(dir, "snap", gen, "");
@@ -764,6 +861,8 @@ int main(int argc, char **argv)
 		final_rc = 130;
 	if (alive)
 		kill(tpid, SIGKILL);
+	if (mode == M_REPLAY)
+		report_replay();
 	if (mode == M_REPLAY && final_rc == 0)
 		say("result: fault is deterministic given the recorded inputs\n");
 	return final_rc;
