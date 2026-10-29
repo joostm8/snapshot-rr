@@ -281,3 +281,7 @@ late ticks (wake-up > 5 ms or timer ticks missed): 27, 16 ticks missed in total;
   signal, a thread race or a `recvmsg`) breaks replay and shows up as `DIVERGENCE`.
 - After `criu restore -s` there is a short window before the supervisor attaches. A traced syscall
   in that window would fail with `ENOSYS`.
+
+## future work:
+
+transfer of snapshots between systems, restore on other system
