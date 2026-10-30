@@ -1,6 +1,7 @@
 /build
 /run
 /run-bench
+demo_bundle.tar.gz
 # Prerequisites
 *.d
 

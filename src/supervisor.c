@@ -8,6 +8,7 @@
  * trace/N.bin holds everything recorded after snapshot N (N=0: since launch).
  */
 #define _GNU_SOURCE
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <ftw.h>
@@ -47,7 +48,8 @@ static struct {
 	const char *workdir, *launcher, *controller, *criu;
 	int interval_ms, keep, use_criu, auto_replay, verbose;
 	pid_t plant_pid;
-} cfg = {"run", "build/launcher", "build/controller", "criu", 2000, 3, 1, 0, 0, 0};
+	int stop_on_fault, replay_only;
+} cfg = {"run", "build/launcher", "build/controller", "criu", 2000, 3, 1, 0, 0, 0, 0, 0};
 
 static char sock_path[PATH_MAX], log_path[PATH_MAX];
 static pid_t tpid;
@@ -724,6 +726,15 @@ static void take_snapshot(void)
 		say("criu dump failed (rc=%d), see %s/dump.log; keeping previous snapshot\n", rc, tmp);
 		return;
 	}
+	{ /* lets a replay-only run on another machine split original.log from the pre-snapshot output */
+		char p[PATH_MAX];
+		gen_path(p, "snap", gen, "/log_off");
+		FILE *f = fopen(p, "w");
+		if (f) {
+			fprintf(f, "%lld\n", (long long)snap_off);
+			fclose(f);
+		}
+	}
 	acc_add(&st_freeze, (t_end - t_stop) * 1e3);
 	acc_add(&st_dump, (t_dump1 - t_dump0) * 1e3);
 	if (nsnapwin < MAXSNAP)
@@ -756,7 +767,9 @@ static int do_replay(void)
 {
 	char dir[PATH_MAX];
 
-	if (cfg.plant_pid > 0) {
+	if (cfg.replay_only) {
+		/* nothing to stop: the plant is not on this machine */
+	} else if (cfg.plant_pid > 0) {
 		say("stopping plant (pid %d)\n", cfg.plant_pid);
 		kill(cfg.plant_pid, SIGTERM);
 	} else {
@@ -775,10 +788,12 @@ static int do_replay(void)
 			return -1;
 	}
 
-	kill(tpid, SIGKILL);
-	int st;
-	while (waitpid(tpid, &st, __WALL) > 0 && !(WIFEXITED(st) || WIFSIGNALED(st)))
-		;
+	if (!cfg.replay_only) {
+		kill(tpid, SIGKILL);
+		int st;
+		while (waitpid(tpid, &st, __WALL) > 0 && !(WIFEXITED(st) || WIFSIGNALED(st)))
+			;
+	}
 	alive = suspended = pending = 0;
 	if (logfd >= 0)
 		close(logfd);
@@ -789,11 +804,23 @@ static int do_replay(void)
 		gen_path(dir, "snap", gen, "");
 		say("restoring snapshot %d with CRIU\n", gen);
 		/* -s: come back stopped so no traced syscall can run before we are attached */
+		char pidfile[PATH_MAX];
+		gen_path(pidfile, "snap", gen, "/restore.pid");
 		char *rst[] = {(char *)cfg.criu, "restore", "-D", dir, "-d", "-s", "-o", "restore.log",
-			       "-v4", NULL};
+			       "--pidfile", pidfile, "-v4", NULL};
 		if (run_cmd(rst) != 0) {
 			say("criu restore failed, see %s/restore.log\n", dir);
 			return -1;
+		}
+		if (cfg.replay_only) {
+			FILE *pf = fopen(pidfile, "r");
+			int rp = 0;
+			if (!pf || fscanf(pf, "%d", &rp) != 1 || rp <= 0) {
+				say("cannot read restored pid from %s\n", pidfile);
+				return -1;
+			}
+			fclose(pf);
+			tpid = rp;
 		}
 		if (attach_resume() < 0)
 			return -1;
@@ -836,6 +863,12 @@ static void handle_alert(void)
 	}
 	say("controller (pid %d) suspended; last snapshot=%d, %u syscalls recorded since\n", tpid, gen, nrec);
 	report_timing();
+	if (cfg.stop_on_fault) {
+		say("stopping at the fault: snapshot %d and trace-%06d are ready to copy to another machine\n",
+		    gen, gen);
+		finish(0);
+		return;
+	}
 	if (do_replay() < 0)
 		finish(1);
 }
@@ -861,6 +894,8 @@ static void usage(const char *a)
 		"  --no-criu           no snapshots; replay restarts the controller from scratch\n"
 		"  --plant-pid PID     SIGTERM this plant on fault (else you are asked to stop it)\n"
 		"  --auto-replay       don't wait for Enter before restoring\n"
+		"  --stop-on-fault     on fault just stop (keep snapshots + traces), no replay\n"
+		"  --replay-only       don't record: restore newest snapshot in --workdir and replay\n"
 		"  -v                  log every recorded/replayed syscall\n",
 		a);
 	exit(2);
@@ -872,6 +907,7 @@ int main(int argc, char **argv)
 		{"workdir", 1, 0, 'w'}, {"launcher", 1, 0, 'l'}, {"controller", 1, 0, 'c'},
 		{"interval", 1, 0, 'i'}, {"keep", 1, 0, 'k'}, {"criu", 1, 0, 'C'},
 		{"no-criu", 0, 0, 'n'}, {"plant-pid", 1, 0, 'p'}, {"auto-replay", 0, 0, 'a'},
+		{"stop-on-fault", 0, 0, 's'}, {"replay-only", 0, 0, 'r'},
 		{0, 0, 0, 0}};
 	int o;
 	while ((o = getopt_long(argc, argv, "v", lo, NULL)) != -1) {
@@ -885,6 +921,8 @@ int main(int argc, char **argv)
 		case 'n': cfg.use_criu = 0; break;
 		case 'p': cfg.plant_pid = atoi(optarg); break;
 		case 'a': cfg.auto_replay = 1; break;
+		case 's': cfg.stop_on_fault = 1; break;
+		case 'r': cfg.replay_only = cfg.auto_replay = 1; break;
 		case 'v': cfg.verbose = 1; break;
 		default: usage(argv[0]);
 		}
@@ -899,15 +937,18 @@ int main(int argc, char **argv)
 	if (!realpath(cfg.workdir, rp))
 		die("workdir");
 	cfg.workdir = strdup(rp);
-	snprintf(p, sizeof p, "%s/trace", cfg.workdir);
-	rm_rf(p);
-	mkdir(p, 0755);
-	snprintf(p, sizeof p, "%s/snap", cfg.workdir);
-	rm_rf(p);
-	mkdir(p, 0755);
+	if (!cfg.replay_only) {
+		snprintf(p, sizeof p, "%s/trace", cfg.workdir);
+		rm_rf(p);
+		mkdir(p, 0755);
+		snprintf(p, sizeof p, "%s/snap", cfg.workdir);
+		rm_rf(p);
+		mkdir(p, 0755);
+	}
 	snprintf(sock_path, sizeof sock_path, "%s/sup.sock", cfg.workdir);
 	snprintf(log_path, sizeof log_path, "%s/controller.log", cfg.workdir);
-	unlink(log_path);
+	if (!cfg.replay_only)
+		unlink(log_path);
 	if (realpath(cfg.launcher, rp)) cfg.launcher = strdup(rp);
 	if (realpath(cfg.controller, rp)) cfg.controller = strdup(rp);
 
@@ -934,6 +975,33 @@ int main(int argc, char **argv)
 
 	snap_fd = timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC | TFD_NONBLOCK);
 
+	if (cfg.replay_only) {
+		if (cfg.use_criu) {
+			char sd[PATH_MAX];
+			snprintf(sd, sizeof sd, "%s/snap", cfg.workdir);
+			DIR *d = opendir(sd);
+			for (struct dirent *e; d && (e = readdir(d));)
+				if (e->d_name[0] != '.' && atoi(e->d_name) > gen)
+					gen = atoi(e->d_name);
+			if (d)
+				closedir(d);
+			if (gen == 0) {
+				fprintf(stderr, "no snapshots in %s\n", sd);
+				return 1;
+			}
+			gen_path(sd, "snap", gen, "/log_off");
+			FILE *f = fopen(sd, "r");
+			long long off = 0;
+			if (f && fscanf(f, "%lld", &off) == 1)
+				snap_off = off;
+			if (f)
+				fclose(f);
+		}
+		say("replay-only: using snapshot %d from %s\n", gen, cfg.workdir);
+		if (do_replay() < 0)
+			return 1;
+		goto loop;
+	}
 	launch();
 	mode = M_RECORD;
 	trace_open(0);
@@ -947,6 +1015,7 @@ int main(int argc, char **argv)
 		timerfd_settime(snap_fd, 0, &its, NULL);
 	}
 
+loop:
 	while (!finished && !stop_req) {
 		struct pollfd pf[3] = {{sig_fd, POLLIN, 0}, {alert_fd, POLLIN, 0}, {snap_fd, POLLIN, 0}};
 		if (poll(pf, 3, -1) < 0)
