@@ -153,6 +153,17 @@ Supervisor options:
 Exit code: `0` fault reproduced, `1` not reproduced or an error, `2` replay diverged, `130`
 interrupted.
 
+### Restoring on another machine: `bad mode` error
+
+CRIU checks that the mode of every open file and directory matches the dump. If restore fails
+with `File home/<user>/snapshot-rr has bad mode 040775 (expect 040755)` (seen moving a bundle
+from WSL to Ubuntu, where the default umask differs), either:
+
+- make the repo directory match machine A: `chmod 755 /home/<user>/snapshot-rr`, or
+- skip the check by adding `"--skip-file-rwx-check"` to the `criu restore` arguments (`rst[]`) in
+  [src/supervisor.c](src/supervisor.c#L809-L810). This also hides real mode mismatches on other
+  restored files.
+
 The sampling rate is `TICK_NS` in [src/common.h](src/common.h) (10 ms by default).
 
 ## Expected output
