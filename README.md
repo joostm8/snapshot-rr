@@ -15,7 +15,9 @@ The controller source contains no snapshot, tracing or replay code.
 In this demo, a simple control process (plant + controller) is running on one machine (WSL Ubuntu in Windows).
 A fault is triggered on that machine, the recorded snapshot and traces are then moved over to another machine (Ubuntu in VirtualBox) to restore the process and reproduce the fault.
 
-<img src="https://img.youtube.com/vi/HbRnMjAWeqw/hqdefault.jpg" alt="Watch the demo">
+[![Watch the demo on YouTube](https://img.youtube.com/vi/HbRnMjAWeqw/hqdefault.jpg)](https://youtu.be/HbRnMjAWeqw)
+
+[▶ Watch the demo on YouTube](https://youtu.be/HbRnMjAWeqw)
 
 ## Architecture
 
